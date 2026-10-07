@@ -32,6 +32,17 @@ MIN_PUNTO_CRITICO = 3        # siniestros minimos para listar una ubicacion como
 
 st.set_page_config(page_title="Siniestros viales en Chile", page_icon=":material/traffic:", layout="wide")
 
+# Ajustes para verse bien insertado en un iframe angosto (sitio web): menos margen alrededor del contenido,
+# y cifras de los indicadores que se achican segun el ancho de su tarjeta en vez de cortarse con "..."
+st.markdown("""<style>
+[data-testid="stMainBlockContainer"] { padding-top: 2.5rem; padding-left: 2rem; padding-right: 2rem; }
+[data-testid="stMetric"] { container-type: inline-size; }
+[data-testid="stMetricValue"] { font-size: min(2.25rem, 17cqi); }
+[data-testid="stMetricValue"] > div { overflow: visible; text-overflow: clip; }
+[data-testid="stMetricLabel"] p { white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.25; }
+[data-testid="stMetricLabel"] { min-height: 2.5em; align-items: flex-start; }
+</style>""", unsafe_allow_html=True)
+
 # ---------------------------------------------------------------------------
 # Paleta (instancia de referencia validada: azul secuencial y colores de estado)
 # ---------------------------------------------------------------------------
@@ -91,7 +102,10 @@ def rgb(hexa: str, alfa: int = 255) -> list[int]:
 # ---------------------------------------------------------------------------
 # Datos
 # ---------------------------------------------------------------------------
-@st.cache_data(show_spinner="Cargando siniestros...")
+# cache_resource y no cache_data: cache_data entrega una copia completa de la tabla en cada interaccion de cada
+# visitante, y con 1,3 millones de filas eso agota la memoria de Streamlit Community Cloud. La tabla no se modifica
+# despues de cargarla, asi que todas las visitas pueden compartir el mismo objeto.
+@st.cache_resource(show_spinner="Cargando siniestros...")
 def cargar() -> tuple[pd.DataFrame, dict]:
     # La etapa 9 parte la tabla en varios archivos para que cada uno quepa en la subida web de GitHub
     partes = [pd.read_parquet(p) for p in PARTES]
@@ -146,15 +160,16 @@ with st.sidebar:
     st.caption("Datos: Carabineros de Chile (OS2). Coordenadas: © colaboradores de OpenStreetMap (ODbL) y red vial "
                "de la Dirección de Vialidad (MOP).")
 
-m = df["anio"].between(*anios)
+# La mascara solo incluye los filtros que restringen algo: sin filtros, f es la misma tabla y no se copia
+m = pd.Series(True, index=df.index)
+if tuple(anios) != (a_min, a_max):
+    m &= df["anio"].between(*anios)
 if region != "Todas":
     m &= df["region"] == region
 if comunas:
     m &= df["comuna"].isin(comunas)
-if zona:
-    m &= df["urbano_rural"].isin(zona)
-else:
-    m &= False
+if set(zona or []) != {"Urbano", "Rural"}:
+    m &= df["urbano_rural"].isin(zona or [])
 if tipos:
     m &= df["tipo_siniestro"].isin(tipos)
 if gravedad == GRAVEDADES[1]:
@@ -169,7 +184,7 @@ if usuarios:
         col = USUARIOS[u]
         mu |= (df[col] > 0) if col == "peatones" else df[col]
     m &= mu
-f = df[m]
+f = df if m.all() else df[m]
 col_medida, nombre_medida = MEDIDAS[medida]
 
 # ---------------------------------------------------------------------------
@@ -218,7 +233,10 @@ def vista(lat: pd.Series, lon: pd.Series) -> pdk.ViewState:
 # Mapa
 # ---------------------------------------------------------------------------
 with t_mapa:
-    dm = f[f["lat"].notna() & (f["geo_precision_m"] <= precision)]
+    # solo las columnas que usa el mapa, para no copiar la tabla completa
+    dm = f.loc[f["lat"].notna() & (f["geo_precision_m"] <= precision),
+               ["lat", "lon", "fallecidos", "graves", "fecha", "hora", "direccion", "comuna", "tipo_siniestro",
+                "geo_metodo", "geo_precision_m"]]
     st.caption(f"{fmt(len(dm))} siniestros en el mapa ({fmt(len(dm) / len(f) * 100, 1)} % de los filtrados). "
                f"El resto no tiene coordenadas o su ubicación es menos precisa que {fmt(precision)} m.")
     if dm.empty:
@@ -247,7 +265,8 @@ with t_mapa:
     else:
         span = max(dm["lat"].quantile(0.99) - dm["lat"].quantile(0.01), 0.05)
         celda = max(0.0015, span / 400)
-        g = (dm.assign(gy=(dm["lat"] / celda).round(), gx=(dm["lon"] / celda).round())
+        g = (pd.DataFrame({"gy": (dm["lat"] / celda).round(), "gx": (dm["lon"] / celda).round(),
+                           "lat": dm["lat"], "lon": dm["lon"]})
              .groupby(["gy", "gx"]).agg(n=("lat", "size"), lat=("lat", "mean"), lon=("lon", "mean")).reset_index())
         capa = pdk.Layer("HeatmapLayer", data=g[["lon", "lat", "n"]], get_position=["lon", "lat"], get_weight="n",
                          radius_pixels=35, intensity=1, threshold=0.03, aggregation="SUM",
@@ -298,7 +317,7 @@ with t_evol:
 # Dias y horas
 # ---------------------------------------------------------------------------
 with t_hora:
-    hd = f.dropna(subset=["hora", "dia_semana"]).groupby(["dia_semana", "hora"])[col_medida].sum().reset_index(name="valor")
+    hd = f[["dia_semana", "hora", col_medida]].dropna(subset=["hora", "dia_semana"]).groupby(["dia_semana", "hora"])[col_medida].sum().reset_index(name="valor")
     hd["dia"] = hd["dia_semana"].astype(int).map(lambda d: DIAS[d])
     hd["hora_txt"] = hd["hora"].astype(int).map(lambda h: f"{h:02d}:00 a {h:02d}:59")
     hd["valor_txt"] = hd["valor"].map(fmt)
@@ -359,10 +378,12 @@ with t_crit:
         "porque concentran siniestros de toda una vía en un solo punto.")
     if precision > 300:
         st.caption("La precisión elegida en los filtros supera 300 m; aquí se usa 300 m.")
-    bc = f[f["lat"].notna() & (f["geo_precision_m"] <= prec_crit) & f["direccion"].notna()]
+    sel = f["lat"].notna() & (f["geo_precision_m"] <= prec_crit) & f["direccion"].notna()
+    bc = pd.DataFrame({c: f.loc[sel, c] for c in ["comuna", "direccion", "fallecidos", "graves", "ksi", "anio", "lat", "lon"]})
+    bc["con_peaton"] = (f.loc[sel, "peatones"] > 0).astype("int16")
     g = (bc.groupby(["comuna", "direccion"], observed=True)
-         .agg(siniestros=("siniestros", "size"), fallecidos=("fallecidos", "sum"), graves=("graves", "sum"),
-              ksi=("ksi", "sum"), peatones=("peatones", lambda s: int((s > 0).sum())),
+         .agg(siniestros=("anio", "size"), fallecidos=("fallecidos", "sum"), graves=("graves", "sum"),
+              ksi=("ksi", "sum"), peatones=("con_peaton", "sum"),
               desde=("anio", "min"), hasta=("anio", "max"), lat=("lat", "median"), lon=("lon", "median"))
          .reset_index())
     g = g[g["siniestros"] >= MIN_PUNTO_CRITICO]
@@ -410,8 +431,9 @@ with t_crit:
 with t_cal:
     st.markdown("Cada siniestro se ubicó a partir de la dirección del parte policial. El método indica cómo se "
                 "obtuvo la coordenada y, con ello, su precisión estimada (no medida).")
-    cal = (f.assign(geo_metodo=f["geo_metodo"].astype(str).replace({"nan": "sin coordenadas", "None": "sin coordenadas"}))
-           .groupby("geo_metodo").agg(valor=("siniestros", "size"), precision=("geo_precision_m", "first")).reset_index())
+    cal = (pd.DataFrame({"geo_metodo": f["geo_metodo"].astype(str).replace({"nan": "sin coordenadas", "None": "sin coordenadas"}),
+                         "geo_precision_m": f["geo_precision_m"]})
+           .groupby("geo_metodo").agg(valor=("geo_precision_m", "size"), precision=("geo_precision_m", "first")).reset_index())
     cal["descripcion"] = cal["geo_metodo"].map(METODOS).fillna("Sin coordenadas")
     cal["precision_txt"] = cal["precision"].map(lambda v: f"{fmt(v)} m" if pd.notna(v) else "-")
     cal = cal.sort_values("precision", na_position="last")
@@ -424,7 +446,7 @@ with t_cal:
         "geo_metodo": "Método", "descripcion": "Qué significa", "precision_txt": "Precisión estimada", "valor": "Siniestros"})
     st.dataframe(tabla, hide_index=True, column_config={"Siniestros": st.column_config.TextColumn(),
                                                         "Qué significa": st.column_config.TextColumn(width="large")})
-    por_anio = (f.assign(ok=f["lat"].notna() & (f["geo_precision_m"] <= 60)).groupby("anio")["ok"].mean()
+    por_anio = ((f["lat"].notna() & (f["geo_precision_m"] <= 60)).groupby(f["anio"]).mean()
                 .mul(100).reset_index(name="valor"))
     por_anio["valor_txt"] = por_anio["valor"].map(lambda v: f"{fmt(v, 1)} %")
     ch2 = (alt.Chart(por_anio, title="Siniestros ubicados con precisión de 60 m o mejor, por año")
@@ -461,3 +483,10 @@ bajo la licencia Open Database License (ODbL). Red vial: Dirección de Vialidad,
 
 Datos generados el {meta.get('generado', '-')}.
 """)
+
+# Libera las tablas intermedias de esta interaccion: Streamlit puede mantener vivo el espacio de nombres de la
+# corrida anterior, y con 1,3 millones de filas cada copia pesa cientos de MB
+import gc
+for _v in ("f", "m", "mu", "dm", "pts", "datos", "bc", "sel", "g", "pool", "hd", "cal", "por_anio"):
+    globals().pop(_v, None)
+gc.collect()
