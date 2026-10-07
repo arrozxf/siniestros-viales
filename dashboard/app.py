@@ -2,7 +2,7 @@
 dashboard/app.py
 
 Dashboard de siniestros viales en Chile, a partir de los registros del Departamento OS2 de
-Carabineros (2010 en adelante). Lee dashboard/datos/siniestros.parquet, que genera la etapa 9
+Carabineros (2010 en adelante). Lee dashboard/datos/siniestros_N.parquet, que genera la etapa 9
 de script.py.
 
 Uso local:
@@ -24,6 +24,9 @@ import pydeck as pdk
 import streamlit as st
 
 DATOS = Path(__file__).parent / "datos"
+# siniestros_1.parquet, siniestros_2.parquet, ... en orden numerico (tambien acepta un siniestros.parquet unico)
+PARTES = sorted(DATOS.glob("siniestros*.parquet"),
+                key=lambda p: int(p.stem.rpartition("_")[2]) if p.stem.rpartition("_")[2].isdigit() else 0)
 MAX_PUNTOS = 30_000          # sobre este numero el mapa muestra densidad en vez de puntos
 MIN_PUNTO_CRITICO = 3        # siniestros minimos para listar una ubicacion como punto critico
 
@@ -90,7 +93,13 @@ def rgb(hexa: str, alfa: int = 255) -> list[int]:
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner="Cargando siniestros...")
 def cargar() -> tuple[pd.DataFrame, dict]:
-    df = pd.read_parquet(DATOS / "siniestros.parquet")
+    # La etapa 9 parte la tabla en varios archivos para que cada uno quepa en la subida web de GitHub
+    partes = [pd.read_parquet(p) for p in PARTES]
+    df = pd.concat(partes, ignore_index=True) if len(partes) > 1 else partes[0]
+    # Al unir partes con categorias distintas pandas las deja como texto; se vuelven a categorizar
+    for c in ["cod_region", "region", "cod_comuna", "comuna", "urbano_rural", "tipo_siniestro", "causa", "geo_metodo"]:
+        if c in df.columns and not isinstance(df[c].dtype, pd.CategoricalDtype):
+            df[c] = df[c].astype("category")
     df["ksi"] = ((df["fallecidos"] + df["graves"]) > 0).astype("int8")
     df["lesionados"] = (df[["fallecidos", "graves", "menos_graves", "leves"]].sum(axis=1) > 0)
     df["siniestros"] = np.int8(1)
@@ -101,8 +110,8 @@ def cargar() -> tuple[pd.DataFrame, dict]:
     return df, meta
 
 
-if not (DATOS / "siniestros.parquet").exists():
-    st.error("No se encontro dashboard/datos/siniestros.parquet. Generalo con: python script.py --desde 9")
+if not PARTES:
+    st.error("No se encontraron archivos dashboard/datos/siniestros_N.parquet. Generalos con: python script.py --desde 9")
     st.stop()
 
 df, meta = cargar()

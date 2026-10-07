@@ -1,0 +1,23 @@
+{
+  "generado": "2026-10-07 16:19",
+  "fecha_min": "2010-01-01",
+  "fecha_max": "2026-08-31",
+  "anio_max": 2026,
+  "meses_anio_max": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "filas": 1275080,
+  "con_coordenadas": 1167890,
+  "fuentes": {
+    "siniestros": "Carabineros de Chile, Departamento OS2, transparencia activa",
+    "coordenadas": "Datos (c) colaboradores de OpenStreetMap, licencia ODbL",
+    "kilometraje": "Red vial de la Direccion de Vialidad, Ministerio de Obras Publicas"
+  }
+}
