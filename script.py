@@ -12,7 +12,7 @@ de principio a fin y deja los consolidados listos para analisis.
     Etapa 6  union por grupo, homologacion y revision de calidad
     Etapa 7  direccion unica para geolocalizar (log propio: data/direcciones.log)
     Etapa 8  coordenadas con OpenStreetMap (log propio: data/geolocalizacion.log)
-    Etapa 9  exportacion compacta para el dashboard (dashboard/datos/siniestros.parquet)
+    Etapa 9  exportacion compacta para el dashboard (dashboard/datos/siniestros_N.parquet)
 
 Uso:
     python script.py                    corre las nueve etapas
@@ -3403,11 +3403,13 @@ if DESDE <= 8 <= HASTA:
 # ===========================================================================
 # ETAPA 9: exportacion compacta para el dashboard
 # ===========================================================================
-# Un solo archivo Parquet con una fila por siniestro, tipos compactos y las variables que usa el
-# dashboard (incluye agregados de personas y vehiculos). Esta pensado para subirse al repositorio,
-# porque Streamlit Community Cloud solo ejecuta el dashboard: GitHub no acepta archivos de mas de 100 MB.
+# Archivos Parquet con una fila por siniestro, tipos compactos y las variables que usa el dashboard
+# (incluye agregados de personas y vehiculos). Estan pensados para subirse al repositorio, porque
+# Streamlit Community Cloud solo ejecuta el dashboard. La pagina web de GitHub no acepta archivos de
+# mas de 25 MiB, asi que la tabla se parte en siniestros_1.parquet, siniestros_2.parquet, etc., cada
+# uno bajo DASH_PARTE_MB; el dashboard lee y une todas las partes.
 DASH_DIR = BASE_DIR / "dashboard" / "datos"
-DASH_MAX_MB = 95
+DASH_PARTE_MB = 23
 # Grupos de vehiculos por palabra clave sobre tipo_vehiculo (minusculas, sin tildes)
 GRUPOS_VEHICULO = {
     # "moto" como palabra o prefijo de motocicleta: "Patin Motorizado", "Triciclo Motorizado" y "Sin Motor" no son motos
@@ -3474,14 +3476,32 @@ if DESDE <= 9 <= HASTA:
         })
         for _c in ["cod_region", "region", "cod_comuna", "comuna", "urbano_rural", "tipo_siniestro", "causa", "geo_metodo"]:
             _out[_c] = _out[_c].astype("category")
-        _ruta_pq = DASH_DIR / "siniestros.parquet"
-        _tmp = _ruta_pq.with_suffix(".tmp")
-        _out.to_parquet(_tmp, index=False, compression="zstd")
-        os.replace(_tmp, _ruta_pq)
-        _mb = _ruta_pq.stat().st_size / 1024 / 1024
-        (log.warning if _mb > DASH_MAX_MB else log.info)(
-            "Escrito: %s (%s filas, %d columnas, %.1f MB%s)", _ruta_pq, miles(len(_out)), _out.shape[1], _mb,
-            "; supera el limite de GitHub, usar Git LFS" if _mb > DASH_MAX_MB else "")
+        # Orden cronologico: comprime mejor y cada parte queda con un tramo de fechas continuo
+        _out = _out.sort_values("fecha", kind="stable").reset_index(drop=True)
+        _opts = dict(index=False, compression="zstd", compression_level=19)
+        _n = 1
+        while True:
+            _partes = []
+            for _i, _ini in enumerate(range(0, len(_out), -(-len(_out) // _n)), 1):
+                _tmp = DASH_DIR / f"siniestros_{_i}.parquet.tmp"
+                _out.iloc[_ini:_ini + -(-len(_out) // _n)].to_parquet(_tmp, **_opts)
+                _partes.append(_tmp)
+            _mb_max = max(_t.stat().st_size for _t in _partes) / 1024 / 1024
+            if _mb_max <= DASH_PARTE_MB or _n >= 20:
+                break
+            for _t in _partes:
+                _t.unlink()
+            _n = int(_n * _mb_max / DASH_PARTE_MB) + 1
+        # Solo cuando las partes nuevas estan completas se borran las anteriores y se renombran
+        for _v in DASH_DIR.glob("siniestros*.parquet"):
+            _v.unlink()
+        for _t in _partes:
+            os.replace(_t, _t.with_suffix(""))
+        _mb = sum(_t.with_suffix("").stat().st_size for _t in _partes) / 1024 / 1024
+        (log.warning if _mb_max > DASH_PARTE_MB else log.info)(
+            "Escrito: %s (%d parte%s, %s filas, %d columnas, %.1f MB en total, la mayor %.1f MB%s)",
+            DASH_DIR, len(_partes), "" if len(_partes) == 1 else "s", miles(len(_out)), _out.shape[1], _mb, _mb_max,
+            "; supera el limite de subida por navegador de GitHub" if _mb_max > DASH_PARTE_MB else "")
 
         # Metadatos: periodo cubierto, meses completos del ultimo anio y fuentes
         _ult = _out["fecha"].max()
