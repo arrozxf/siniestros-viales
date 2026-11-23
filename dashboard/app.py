@@ -29,6 +29,10 @@ PARTES = sorted(DATOS.glob("siniestros*.parquet"),
                 key=lambda p: int(p.stem.rpartition("_")[2]) if p.stem.rpartition("_")[2].isdigit() else 0)
 MAX_PUNTOS = 30_000          # sobre este numero el mapa muestra densidad en vez de puntos
 MIN_PUNTO_CRITICO = 3        # siniestros minimos para listar una ubicacion como punto critico
+LIMITE_DESCARGA = 100_000    # filas maximas del detalle descargable (memoria de Streamlit Community Cloud)
+COLS_DESCARGA = ["fecha", "hora", "region", "comuna", "urbano_rural", "tipo_siniestro", "causa", "direccion",
+                 "fallecidos", "graves", "menos_graves", "leves", "ilesos", "peatones", "moto", "bicicleta", "bus",
+                 "camion", "lat", "lon", "geo_metodo", "geo_precision_m"]
 
 st.set_page_config(page_title="Siniestros viales en Chile", page_icon=":material/traffic:", layout="wide")
 
@@ -97,6 +101,11 @@ def fmt(n, dec: int = 0) -> str:
 
 def rgb(hexa: str, alfa: int = 255) -> list[int]:
     return [int(hexa[i:i + 2], 16) for i in (1, 3, 5)] + [alfa]
+
+
+def a_csv(datos: pd.DataFrame) -> bytes:
+    """CSV que Excel en espanol abre bien: punto y coma, coma decimal y BOM para los acentos."""
+    return datos.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +375,38 @@ with t_comp:
     por_comuna = (f.groupby("comuna", observed=True)[col_medida].sum().sort_values(ascending=False).head(20)
                   .reset_index(name="valor"))
     st.altair_chart(barras(por_comuna[por_comuna["valor"] > 0], "comuna", f"Comunas con más {nombre_medida}"), width="stretch")
+
+    # Descargas por comuna. download_button arma su contenido en cada ejecucion del script, por eso el resumen
+    # (liviano) siempre esta disponible y el detalle solo se construye cuando el usuario activa el interruptor.
+    st.divider()
+    st.subheader("Descargar datos por comuna")
+    st.caption("Las descargas respetan todos los filtros de la barra lateral.")
+    resumen = (f.groupby("comuna", observed=True)
+               .agg(siniestros=("siniestros", "size"), fallecidos=("fallecidos", "sum"), graves=("graves", "sum"),
+                    con_fallecidos_o_graves=("ksi", "sum"), con_peatones=("peatones", lambda s: int((s > 0).sum())))
+               .sort_values("siniestros", ascending=False).reset_index())
+    resumen["fallecidos_por_100"] = (resumen["fallecidos"] / resumen["siniestros"] * 100).round(2)
+    st.download_button("Resumen por comuna (CSV)", a_csv(resumen), file_name="resumen_comunas.csv",
+                       mime="text/csv", icon=":material/download:")
+
+    d1, d2 = st.columns([1, 2])
+    n_comuna = int(d1.number_input("Siniestros por comuna", min_value=1, max_value=50_000, value=500, step=100))
+    criterio = d2.segmented_control("Tomar los", ["Más recientes", "Más graves"], default="Más recientes",
+                                    required=True)
+    n_filas = int(f["comuna"].value_counts().clip(upper=n_comuna).sum())
+    st.caption(f"El detalle tendría {fmt(n_filas)} siniestros "
+               f"(hasta {fmt(n_comuna)} por comuna, {criterio.lower()}).")
+    if n_filas > LIMITE_DESCARGA:
+        st.warning(f"El detalle supera {fmt(LIMITE_DESCARGA)} filas. Elige una región o comunas, acota los años "
+                   "o baja la cantidad por comuna.")
+    elif st.toggle("Preparar archivo de detalle"):
+        cols = [c for c in COLS_DESCARGA if c in f.columns]
+        claves = ["fecha"] if criterio == "Más recientes" else ["fallecidos", "graves", "fecha"]
+        detalle = (f[cols].sort_values(claves, ascending=False).groupby("comuna", observed=True).head(n_comuna)
+                   .sort_values(["comuna", "fecha"]))
+        detalle["fecha"] = detalle["fecha"].dt.strftime("%d-%m-%Y")
+        st.download_button("Detalle de siniestros (CSV)", a_csv(detalle), file_name="siniestros_por_comuna.csv",
+                           mime="text/csv", icon=":material/download:")
 
 # ---------------------------------------------------------------------------
 # Puntos criticos
