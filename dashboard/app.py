@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
+from pyproj import Transformer
 
 DATOS = Path(__file__).parent / "datos"
 # siniestros_1.parquet, siniestros_2.parquet, ... en orden numerico (tambien acepta un siniestros.parquet unico)
@@ -101,6 +102,31 @@ def fmt(n, dec: int = 0) -> str:
 
 def rgb(hexa: str, alfa: int = 255) -> list[int]:
     return [int(hexa[i:i + 2], 16) for i in (1, 3, 5)] + [alfa]
+
+
+def agregar_utm(datos: pd.DataFrame) -> pd.DataFrame:
+    """Agrega georreferenciado (Sí/No) y coordenadas UTM WGS 84 (huso, este, norte) en metros.
+
+    Huso = floor((lon + 180) / 6) + 1; hemisferio sur -> EPSG:327<huso>. En Chile continental quedan los husos
+    18S y 19S; Rapa Nui cae en el 12S. Cada siniestro se proyecta en su propio huso, que es lo correcto para
+    medir en terreno pero no permite mezclar puntos de husos distintos en un mismo plano sin reproyectar.
+    """
+    datos = datos.copy()
+    con = datos["lat"].notna() & datos["lon"].notna()
+    datos["georreferenciado"] = np.where(con, "Sí", "No")
+    datos["utm_huso"] = pd.Series(pd.NA, index=datos.index, dtype="string")
+    datos["utm_este"] = np.nan
+    datos["utm_norte"] = np.nan
+    lon, lat = datos.loc[con, "lon"].astype("float64"), datos.loc[con, "lat"].astype("float64")
+    huso = (np.floor((lon + 180) / 6) + 1).astype(int)
+    for h in huso.unique():
+        idx = huso.index[huso == h]
+        tr = Transformer.from_crs(4326, 32700 + int(h), always_xy=True)
+        este, norte = tr.transform(lon.loc[idx].to_numpy(), lat.loc[idx].to_numpy())
+        datos.loc[idx, "utm_huso"] = f"{h}S"
+        datos.loc[idx, "utm_este"] = np.round(este, 1)
+        datos.loc[idx, "utm_norte"] = np.round(norte, 1)
+    return datos
 
 
 def a_csv(datos: pd.DataFrame) -> bytes:
@@ -383,27 +409,42 @@ with t_comp:
     st.caption("Las descargas respetan todos los filtros de la barra lateral.")
     resumen = (f.groupby("comuna", observed=True)
                .agg(siniestros=("siniestros", "size"), fallecidos=("fallecidos", "sum"), graves=("graves", "sum"),
-                    con_fallecidos_o_graves=("ksi", "sum"), con_peatones=("peatones", lambda s: int((s > 0).sum())))
+                    con_fallecidos_o_graves=("ksi", "sum"), con_peatones=("peatones", lambda s: int((s > 0).sum())),
+                    georreferenciados=("lat", "count"))
                .sort_values("siniestros", ascending=False).reset_index())
+    resumen["sin_georreferenciar"] = resumen["siniestros"] - resumen["georreferenciados"]
+    resumen["georreferenciados_pct"] = (resumen["georreferenciados"] / resumen["siniestros"] * 100).round(1)
     resumen["fallecidos_por_100"] = (resumen["fallecidos"] / resumen["siniestros"] * 100).round(2)
     st.download_button("Resumen por comuna (CSV)", a_csv(resumen), file_name="resumen_comunas.csv",
                        mime="text/csv", icon=":material/download:")
 
-    d1, d2 = st.columns([1, 2])
-    n_comuna = int(d1.number_input("Siniestros por comuna", min_value=1, max_value=50_000, value=500, step=100))
-    criterio = d2.segmented_control("Tomar los", ["Más recientes", "Más graves"], default="Más recientes",
-                                    required=True)
-    n_filas = int(f["comuna"].value_counts().clip(upper=n_comuna).sum())
-    st.caption(f"El detalle tendría {fmt(n_filas)} siniestros "
-               f"(hasta {fmt(n_comuna)} por comuna, {criterio.lower()}).")
+    todos = st.toggle("Todos los siniestros de cada comuna", value=True,
+                      help="Incluye también los siniestros que no se pudieron georreferenciar; la columna "
+                           "georreferenciado lo indica.")
+    if todos:
+        n_comuna, criterio = None, None
+        n_filas = len(f)
+    else:
+        d1, d2 = st.columns([1, 2])
+        n_comuna = int(d1.number_input("Siniestros por comuna", min_value=1, max_value=50_000, value=500, step=100))
+        criterio = d2.segmented_control("Tomar los", ["Más recientes", "Más graves"], default="Más recientes",
+                                        required=True)
+        n_filas = int(f["comuna"].value_counts().clip(upper=n_comuna).sum())
+    sin_geo = int(f["lat"].isna().sum()) if todos else None
+    st.caption(f"El detalle tendría {fmt(n_filas)} siniestros"
+               + (f", de los cuales {fmt(sin_geo)} no están georreferenciados." if todos else
+                  f" (hasta {fmt(n_comuna)} por comuna, {criterio.lower()}).")
+               + " Incluye coordenadas geográficas (WGS 84) y UTM con su huso.")
     if n_filas > LIMITE_DESCARGA:
-        st.warning(f"El detalle supera {fmt(LIMITE_DESCARGA)} filas. Elige una región o comunas, acota los años "
-                   "o baja la cantidad por comuna.")
+        st.warning(f"El detalle supera {fmt(LIMITE_DESCARGA)} filas. Elige una región o comunas, acota los años"
+                   + ("." if todos else " o baja la cantidad por comuna."))
     elif st.toggle("Preparar archivo de detalle"):
         cols = [c for c in COLS_DESCARGA if c in f.columns]
-        claves = ["fecha"] if criterio == "Más recientes" else ["fallecidos", "graves", "fecha"]
-        detalle = (f[cols].sort_values(claves, ascending=False).groupby("comuna", observed=True).head(n_comuna)
-                   .sort_values(["comuna", "fecha"]))
+        detalle = f[cols]
+        if not todos:
+            claves = ["fecha"] if criterio == "Más recientes" else ["fallecidos", "graves", "fecha"]
+            detalle = detalle.sort_values(claves, ascending=False).groupby("comuna", observed=True).head(n_comuna)
+        detalle = agregar_utm(detalle.sort_values(["comuna", "fecha"]))
         detalle["fecha"] = detalle["fecha"].dt.strftime("%d-%m-%Y")
         st.download_button("Detalle de siniestros (CSV)", a_csv(detalle), file_name="siniestros_por_comuna.csv",
                            mime="text/csv", icon=":material/download:")
